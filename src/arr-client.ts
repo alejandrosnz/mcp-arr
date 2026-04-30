@@ -395,7 +395,7 @@ export class ArrClient {
   /**
    * Make an API request
    */
-  protected async request<T>(endpoint: string, options: RequestInit = {}): Promise<T> {
+  protected async request<T>(endpoint: string, options: RequestInit = {}, timeoutMs = 15000): Promise<T> {
     const url = `${this.config.url}/api/${this.apiVersion}${endpoint}`;
     const headers: Record<string, string> = {
       'Content-Type': 'application/json',
@@ -403,10 +403,24 @@ export class ArrClient {
       ...(options.headers as Record<string, string> || {}),
     };
 
-    const response = await fetch(url, {
-      ...options,
-      headers,
-    });
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), timeoutMs);
+
+    let response: Response;
+    try {
+      response = await fetch(url, {
+        ...options,
+        headers,
+        signal: controller.signal,
+      });
+    } catch (err) {
+      if (err instanceof Error && err.name === 'AbortError') {
+        throw new Error(`${this.serviceName} API timeout after ${timeoutMs}ms: ${endpoint}`);
+      }
+      throw err;
+    } finally {
+      clearTimeout(timer);
+    }
 
     if (!response.ok) {
       const text = await response.text();
@@ -555,7 +569,7 @@ export class SonarrClient extends ArrClient {
    * Search for series
    */
   async searchSeries(term: string): Promise<SearchResult[]> {
-    return this['request']<SearchResult[]>(`/series/lookup?term=${encodeURIComponent(term)}`);
+    return this['request']<SearchResult[]>(`/series/lookup?term=${encodeURIComponent(term)}`, {}, 30000);
   }
 
   /**
@@ -649,7 +663,7 @@ export class RadarrClient extends ArrClient {
    * Search for movies
    */
   async searchMovies(term: string): Promise<SearchResult[]> {
-    return this['request']<SearchResult[]>(`/movie/lookup?term=${encodeURIComponent(term)}`);
+    return this['request']<SearchResult[]>(`/movie/lookup?term=${encodeURIComponent(term)}`, {}, 30000);
   }
 
   /**
