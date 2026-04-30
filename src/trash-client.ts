@@ -94,6 +94,7 @@ class TrashCache {
   private customFormats = new Map<string, CacheEntry<TrashCustomFormat>>();
   private cfLists = new Map<string, CacheEntry<string[]>>();
   private cfGroups = new Map<string, CacheEntry<TrashCFGroup>>();
+  private cfGroupLists = new Map<string, CacheEntry<string[]>>();
   private qualitySizes = new Map<string, CacheEntry<TrashQualitySize>>();
   private naming = new Map<string, CacheEntry<TrashNaming>>();
 
@@ -143,6 +144,15 @@ class TrashCache {
 
   getCFGroup(key: string): TrashCFGroup | null {
     const entry = this.cfGroups.get(key);
+    return this.isValid(entry) ? entry.data : null;
+  }
+
+  setCFGroupList(service: string, data: string[]) {
+    this.cfGroupLists.set(service, { data, timestamp: Date.now() });
+  }
+
+  getCFGroupList(service: string): string[] | null {
+    const entry = this.cfGroupLists.get(service);
     return this.isValid(entry) ? entry.data : null;
   }
 
@@ -387,7 +397,12 @@ export class TrashClient {
    * Get custom format groups
    */
   async listCFGroups(service: TrashService): Promise<string[]> {
-    return listGitHubDir(`${service}/cf-groups`);
+    const cached = cache.getCFGroupList(service);
+    if (cached) return cached;
+
+    const files = await listGitHubDir(`${service}/cf-groups`);
+    cache.setCFGroupList(service, files);
+    return files;
   }
 
   /**

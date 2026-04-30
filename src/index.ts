@@ -735,20 +735,22 @@ if (clients.prowlarr) {
 }
 
 // Cross-service search tool
-TOOLS.push({
-  name: "arr_search_all",
-  description: "Search across all configured *arr services for any media",
-  inputSchema: {
-    type: "object" as const,
-    properties: {
-      term: {
-        type: "string",
-        description: "Search term",
+if (configuredServices.length > 0) {
+  TOOLS.push({
+    name: "arr_search_all",
+    description: "Search across all configured *arr services for any media",
+    inputSchema: {
+      type: "object" as const,
+      properties: {
+        term: {
+          type: "string",
+          description: "Search term",
+        },
       },
+      required: ["term"],
     },
-    required: ["term"],
-  },
-});
+  });
+}
 
 // TRaSH Guides tools (always available - no *arr config required)
 TOOLS.push(
@@ -938,30 +940,43 @@ async function runUnifiedSearch(query: string): Promise<SearchEntry[]> {
 
   const lowerQuery = trimmedQuery.toLowerCase();
 
-  for (const service of ["radarr", "sonarr"] as const) {
-    const profiles = await trashClient.listProfiles(service);
-    results.push(
-      ...profiles
-        .filter((profile) =>
-          profile.name.toLowerCase().includes(lowerQuery) ||
-          profile.description?.toLowerCase().includes(lowerQuery)
-        )
-        .slice(0, 8)
-        .map((profile) => ({
-          id: `trash-profile:${service}:${profile.name}`,
-          title: `${profile.name} (${service})`,
-          url: buildResourceUrl(`trash/profile/${service}/${encodeURIComponent(profile.name)}`),
-          type: "trash_profile",
-          service,
-          summary: profile.description?.replace(/<br>/g, " "),
-        }))
-    );
+  // Fan out all network calls in parallel
+  const [radarrProfiles, sonarrProfiles, seriesResult, moviesResult, artistsResult] =
+    await Promise.allSettled([
+      trashClient.listProfiles("radarr"),
+      trashClient.listProfiles("sonarr"),
+      clients.sonarr ? clients.sonarr.searchSeries(trimmedQuery) : Promise.resolve([]),
+      clients.radarr ? clients.radarr.searchMovies(trimmedQuery) : Promise.resolve([]),
+      clients.lidarr ? clients.lidarr.searchArtists(trimmedQuery) : Promise.resolve([]),
+    ]);
+
+  for (const [service, outcome] of [
+    ["radarr", radarrProfiles],
+    ["sonarr", sonarrProfiles],
+  ] as const) {
+    if (outcome.status === "fulfilled") {
+      results.push(
+        ...outcome.value
+          .filter((profile) =>
+            profile.name.toLowerCase().includes(lowerQuery) ||
+            profile.description?.toLowerCase().includes(lowerQuery)
+          )
+          .slice(0, 8)
+          .map((profile) => ({
+            id: `trash-profile:${service}:${profile.name}`,
+            title: `${profile.name} (${service})`,
+            url: buildResourceUrl(`trash/profile/${service}/${encodeURIComponent(profile.name)}`),
+            type: "trash_profile",
+            service,
+            summary: profile.description?.replace(/<br>/g, " "),
+          }))
+      );
+    }
   }
 
-  if (clients.sonarr) {
-    const series = await clients.sonarr.searchSeries(trimmedQuery);
+  if (clients.sonarr && seriesResult.status === "fulfilled") {
     results.push(
-      ...series.slice(0, 5).map((item) => ({
+      ...seriesResult.value.slice(0, 5).map((item) => ({
         id: `arr:sonarr:series:${item.tvdbId}`,
         title: `${item.title}${item.year ? ` (${item.year})` : ""}`,
         url: buildResourceUrl(`arr/sonarr/series/${item.tvdbId}`),
@@ -972,10 +987,9 @@ async function runUnifiedSearch(query: string): Promise<SearchEntry[]> {
     );
   }
 
-  if (clients.radarr) {
-    const movies = await clients.radarr.searchMovies(trimmedQuery);
+  if (clients.radarr && moviesResult.status === "fulfilled") {
     results.push(
-      ...movies.slice(0, 5).map((item) => ({
+      ...moviesResult.value.slice(0, 5).map((item) => ({
         id: `arr:radarr:movie:${item.tmdbId}`,
         title: `${item.title}${item.year ? ` (${item.year})` : ""}`,
         url: buildResourceUrl(`arr/radarr/movie/${item.tmdbId}`),
@@ -986,10 +1000,9 @@ async function runUnifiedSearch(query: string): Promise<SearchEntry[]> {
     );
   }
 
-  if (clients.lidarr) {
-    const artists = await clients.lidarr.searchArtists(trimmedQuery);
+  if (clients.lidarr && artistsResult.status === "fulfilled") {
     results.push(
-      ...artists.slice(0, 5).map((item) => ({
+      ...artistsResult.value.slice(0, 5).map((item) => ({
         id: `arr:lidarr:artist:${item.foreignArtistId}`,
         title: item.artistName || item.title,
         url: buildResourceUrl(`arr/lidarr/artist/${item.foreignArtistId}`),
@@ -1041,7 +1054,7 @@ async function fetchSearchEntry(id: string): Promise<unknown> {
 
   if (service === "sonarr" && subtype === "series" && clients.sonarr) {
     const tvdbId = Number(rawId);
-    const matches = (await clients.sonarr.searchSeries(rawId)).filter((item) => item.tvdbId === tvdbId);
+    const matches = (await clients.sonarr.searchSeries(`tvdb:${rawId}`)).filter((item) => item.tvdbId === tvdbId);
     return {
       id,
       title: matches[0]?.title || rawId,
@@ -1054,7 +1067,7 @@ async function fetchSearchEntry(id: string): Promise<unknown> {
 
   if (service === "radarr" && subtype === "movie" && clients.radarr) {
     const tmdbId = Number(rawId);
-    const matches = (await clients.radarr.searchMovies(rawId)).filter((item) => item.tmdbId === tmdbId);
+    const matches = (await clients.radarr.searchMovies(`tmdb:${rawId}`)).filter((item) => item.tmdbId === tmdbId);
     return {
       id,
       title: matches[0]?.title || rawId,
@@ -1152,26 +1165,30 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
 
       case "arr_status": {
         const statuses: Record<string, unknown> = {};
-        for (const service of configuredServices) {
-          try {
+
+        await Promise.allSettled(
+          configuredServices.map(async (service) => {
             const client = clients[service.name];
             if (client) {
-              const status = await client.getStatus();
-              statuses[service.name] = {
-                configured: true,
-                connected: true,
-                version: status.version,
-                appName: status.appName,
-              };
+              try {
+                const status = await client.getStatus();
+                statuses[service.name] = {
+                  configured: true,
+                  connected: true,
+                  version: status.version,
+                  appName: status.appName,
+                };
+              } catch (error) {
+                statuses[service.name] = {
+                  configured: true,
+                  connected: false,
+                  error: error instanceof Error ? error.message : String(error),
+                };
+              }
             }
-          } catch (error) {
-            statuses[service.name] = {
-              configured: true,
-              connected: false,
-              error: error instanceof Error ? error.message : String(error),
-            };
-          }
-        }
+          })
+        );
+
         // Add unconfigured services
         for (const service of services) {
           if (!statuses[service.name]) {
@@ -1339,8 +1356,8 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         const client = clients[serviceName];
         if (!client) throw new Error(`${serviceName} not configured`);
 
-        // Gather all configuration data
-        const [status, health, qualityProfiles, qualityDefinitions, downloadClients, naming, mediaManagement, rootFolders, tags, indexers] = await Promise.all([
+        // Gather all configuration data in parallel (includes metadata profiles for Lidarr)
+        const [status, health, qualityProfiles, qualityDefinitions, downloadClients, naming, mediaManagement, rootFolders, tags, indexers, metadataProfilesResult] = await Promise.all([
           client.getStatus(),
           client.getHealth(),
           client.getQualityProfiles(),
@@ -1351,13 +1368,12 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           client.getRootFoldersDetailed(),
           client.getTags(),
           client.getIndexers(),
+          serviceName === 'lidarr' && clients.lidarr
+            ? clients.lidarr.getMetadataProfiles()
+            : Promise.resolve(null),
         ]);
 
-        // For Lidarr, also get metadata profiles
-        let metadataProfiles = null;
-        if (serviceName === 'lidarr' && clients.lidarr) {
-          metadataProfiles = await clients.lidarr.getMetadataProfiles();
-        }
+        const metadataProfiles = metadataProfilesResult;
 
         const review = {
           service: serviceName,
@@ -1461,9 +1477,9 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
               returned: pagedSeries.length,
               offset: normalizedOffset,
               limit: normalizedLimit,
-              hasMore: normalizedOffset + normalizedLimit < filteredSeries.length,
-              nextOffset: normalizedOffset + normalizedLimit < filteredSeries.length
-                ? normalizedOffset + normalizedLimit
+              hasMore: normalizedOffset + pagedSeries.length < filteredSeries.length,
+              nextOffset: normalizedOffset + pagedSeries.length < filteredSeries.length
+                ? normalizedOffset + pagedSeries.length
                 : null,
               search: search ?? null,
               series: pagedSeries.map(s => ({
@@ -1576,8 +1592,10 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       case "sonarr_refresh_series": {
         if (!clients.sonarr) throw new Error("Sonarr not configured");
         const seriesId = (args as { seriesId: number }).seriesId;
-        const series = await clients.sonarr.getSeriesById(seriesId);
-        const result = await clients.sonarr.refreshSeries(seriesId);
+        const [series, result] = await Promise.all([
+          clients.sonarr.getSeriesById(seriesId),
+          clients.sonarr.refreshSeries(seriesId),
+        ]);
         return {
           content: [{
             type: "text",
@@ -1644,9 +1662,9 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
               returned: pagedMovies.length,
               offset: normalizedOffset,
               limit: normalizedLimit,
-              hasMore: normalizedOffset + normalizedLimit < filteredMovies.length,
-              nextOffset: normalizedOffset + normalizedLimit < filteredMovies.length
-                ? normalizedOffset + normalizedLimit
+              hasMore: normalizedOffset + pagedMovies.length < filteredMovies.length,
+              nextOffset: normalizedOffset + pagedMovies.length < filteredMovies.length
+                ? normalizedOffset + pagedMovies.length
                 : null,
               search: search ?? null,
               movies: pagedMovies.map(m => ({
@@ -1720,8 +1738,10 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       case "radarr_refresh_movie": {
         if (!clients.radarr) throw new Error("Radarr not configured");
         const movieId = (args as { movieId: number }).movieId;
-        const movie = await clients.radarr.getMovieById(movieId);
-        const result = await clients.radarr.refreshMovie(movieId);
+        const [movie, result] = await Promise.all([
+          clients.radarr.getMovieById(movieId),
+          clients.radarr.refreshMovie(movieId),
+        ]);
         return {
           content: [{
             type: "text",
@@ -1776,7 +1796,9 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
                 artistName: a.artistName,
                 status: a.status,
                 albums: a.statistics?.albumCount,
-                tracks: a.statistics?.trackFileCount + '/' + a.statistics?.totalTrackCount,
+                tracks: a.statistics
+                  ? `${a.statistics.trackFileCount}/${a.statistics.totalTrackCount}`
+                  : 'unknown',
                 sizeOnDisk: formatBytes(a.statistics?.sizeOnDisk || 0),
                 monitored: a.monitored,
               })),
@@ -1927,17 +1949,6 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         };
       }
 
-      case "lidarr_get_quality_profiles": {
-        if (!clients.lidarr) throw new Error("Lidarr not configured");
-        const profiles = await clients.lidarr.getQualityProfiles();
-        return {
-          content: [{
-            type: "text",
-            text: JSON.stringify(profiles.map(p => ({ id: p.id, name: p.name })), null, 2),
-          }],
-        };
-      }
-
       case "lidarr_get_metadata_profiles": {
         if (!clients.lidarr) throw new Error("Lidarr not configured");
         const profiles = await clients.lidarr.getMetadataProfiles();
@@ -1983,8 +1994,10 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
 
       case "prowlarr_test_indexers": {
         if (!clients.prowlarr) throw new Error("Prowlarr not configured");
-        const results = await clients.prowlarr.testAllIndexers();
-        const indexers = await clients.prowlarr.getIndexers();
+        const [results, indexers] = await Promise.all([
+          clients.prowlarr.testAllIndexers(),
+          clients.prowlarr.getIndexers(),
+        ]);
         const indexerMap = new Map(indexers.map(i => [i.id, i.name]));
         return {
           content: [{
@@ -2034,34 +2047,23 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       // Cross-service search
       case "arr_search_all": {
         const term = (args as { term: string }).term;
+
+        const searches: Array<{ service: string; promise: Promise<unknown[]> }> = [];
+        if (clients.sonarr) searches.push({ service: "sonarr", promise: clients.sonarr.searchSeries(term) });
+        if (clients.radarr) searches.push({ service: "radarr", promise: clients.radarr.searchMovies(term) });
+        if (clients.lidarr) searches.push({ service: "lidarr", promise: clients.lidarr.searchArtists(term) });
+
+        const settled = await Promise.allSettled(searches.map(s => s.promise));
+
         const results: Record<string, unknown> = {};
-
-        if (clients.sonarr) {
-          try {
-            const sonarrResults = await clients.sonarr.searchSeries(term);
-            results.sonarr = { count: sonarrResults.length, results: sonarrResults.slice(0, 5) };
-          } catch (e) {
-            results.sonarr = { error: e instanceof Error ? e.message : String(e) };
+        settled.forEach((outcome, i) => {
+          const service = searches[i].service;
+          if (outcome.status === "fulfilled") {
+            results[service] = { count: outcome.value.length, results: outcome.value.slice(0, 5) };
+          } else {
+            results[service] = { error: outcome.reason instanceof Error ? outcome.reason.message : String(outcome.reason) };
           }
-        }
-
-        if (clients.radarr) {
-          try {
-            const radarrResults = await clients.radarr.searchMovies(term);
-            results.radarr = { count: radarrResults.length, results: radarrResults.slice(0, 5) };
-          } catch (e) {
-            results.radarr = { error: e instanceof Error ? e.message : String(e) };
-          }
-        }
-
-        if (clients.lidarr) {
-          try {
-            const lidarrResults = await clients.lidarr.searchArtists(term);
-            results.lidarr = { count: lidarrResults.length, results: lidarrResults.slice(0, 5) };
-          } catch (e) {
-            results.lidarr = { error: e instanceof Error ? e.message : String(e) };
-          }
-        }
+        });
 
         return {
           content: [{ type: "text", text: JSON.stringify(results, null, 2) }],
@@ -2377,13 +2379,14 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         const recommendedFolder = trashNaming.folder[keys.folder] || trashNaming.folder.default;
         const recommendedFile = trashNaming.file[keys.file] || trashNaming.file.standard;
 
-        // Extract user's current naming (field names vary by service)
+        // Extract user's current naming — field names differ between Radarr and Sonarr
         const namingRecord = userNaming as unknown as Record<string, unknown>;
-        const userFolder = namingRecord.movieFolderFormat ||
-          namingRecord.seriesFolderFormat ||
-          namingRecord.standardMovieFormat;
-        const userFile = namingRecord.standardMovieFormat ||
-          namingRecord.standardEpisodeFormat;
+        const userFolder = service === 'radarr'
+          ? namingRecord.movieFolderFormat
+          : namingRecord.seriesFolderFormat;
+        const userFile = service === 'radarr'
+          ? namingRecord.standardMovieFormat
+          : namingRecord.standardEpisodeFormat;
 
         return {
           content: [{
